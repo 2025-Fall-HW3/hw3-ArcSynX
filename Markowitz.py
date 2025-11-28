@@ -62,6 +62,12 @@ class EqualWeightPortfolio:
         """
         TODO: Complete Task 1 Below
         """
+        # Assign a fixed equal weight to all assets except the one in exclude
+        n_assets = len(assets)
+        # The weight of each asset = 1 / n_assets
+        equal_weights = np.ones(n_assets, dtype=float) / n_assets
+        self.portfolio_weights.loc[:, assets] = equal_weights
+        
 
         """
         TODO: Complete Task 1 Above
@@ -113,7 +119,37 @@ class RiskParityPortfolio:
         """
         TODO: Complete Task 2 Below
         """
+        # Get the returns of all assets except SPY 
+        sub_ret = df_returns[assets]
 
+        # Calculate risk parity weights each day, starting from where we have enough lookback data
+        for i in range(self.lookback + 1, len(df)):
+            # Take the window of past lookback days of returns (excluding today)
+            window = sub_ret.iloc[i - self.lookback : i]
+
+            # Use numpy to manually calculate the standard deviation of each asset (do not use pandas' std())
+            # Steps: first calculate mean, then mean squared difference, then take sqrt
+            mean_vec = window.mean(axis=0).to_numpy()            # Mean return of each asset
+            diff_sq = (window.to_numpy() - mean_vec) ** 2        # (r - μ)^2
+            var_vec = diff_sq.mean(axis=0)                       # Variance of each asset
+            sigma = np.sqrt(var_vec)                             # Volatility of each asset
+
+            # Skip abnormal numerical situations (avoid division by zero)
+            sigma_adj = np.maximum(sigma, 1e-12)
+
+            # Risk parity score: The lower the volatility, the higher the score
+            score = 1.0 / sigma_adj
+
+            total = score.sum()
+            if total <= 0:
+                # Should not happen in theory, but for insurance use equal weight
+                w = np.full(len(assets), 1.0 / len(assets))
+            else:
+                # Normalize to weights so the sum is 1
+                w = score * (1.0 / total)
+
+            # Save the weights for day i (only fill columns not including SPY)
+            self.portfolio_weights.loc[df.index[i], assets] = w
 
 
         """
@@ -175,9 +211,13 @@ class MeanVariancePortfolio:
         self.portfolio_weights.fillna(0, inplace=True)
 
     def mv_opt(self, R_n, gamma):
-        Sigma = R_n.cov().values
-        mu = R_n.mean().values
-        n = len(R_n.columns)
+        # R_n: the past lookback days' returns (DataFrame with columns = assets)
+        # gamma: risk aversion coefficient
+
+        # Estimate μ and Σ
+        mu = R_n.mean().values           # shape: (n,)
+        Sigma = R_n.cov().values         # shape: (n, n)
+        n = len(mu)
 
         with gp.Env(empty=True) as env:
             env.setParam("OutputFlag", 0)
@@ -188,37 +228,42 @@ class MeanVariancePortfolio:
                 TODO: Complete Task 3 Below
                 """
 
-                # Sample Code: Initialize Decision w and the Objective
-                # NOTE: You can modify the following code
-                w = model.addMVar(n, name="w", ub=1)
-                model.setObjective(w.sum(), gp.GRB.MAXIMIZE)
+                # Decision variables: asset weights w_i, long-only: w_i >= 0
+                # Set ub=1 to avoid excessive weights (no leverage, which matches sample code)
+                w = model.addMVar(shape=n, lb=0.0, ub=1.0, name="w")
+
+                # Budget constraint: weights sum to 1 (fully invested)
+                model.addConstr(w.sum() == 1.0, name="budget")
+
+                # Linear part: w^T μ
+                ret_term = mu @ w
+
+                # Quadratic risk term: w^T Σ w
+                risk_term = w @ Sigma @ w
+
+                # Avoid the case where gamma is None
+                if gamma is None:
+                    gamma = 0.0
+
+                # Objective: max w^T μ − (γ/2) w^T Σ w
+                model.setObjective(ret_term - 0.5 * float(gamma) * risk_term,
+                                   gp.GRB.MAXIMIZE)
 
                 """
                 TODO: Complete Task 3 Above
                 """
                 model.optimize()
 
-                # Check if the status is INF_OR_UNBD (code 4)
-                if model.status == gp.GRB.INF_OR_UNBD:
-                    print(
-                        "Model status is INF_OR_UNBD. Reoptimizing with DualReductions set to 0."
-                    )
-                elif model.status == gp.GRB.INFEASIBLE:
-                    # Handle infeasible model
-                    print("Model is infeasible.")
-                elif model.status == gp.GRB.INF_OR_UNBD:
-                    # Handle infeasible or unbounded model
-                    print("Model is infeasible or unbounded.")
-
-                if model.status == gp.GRB.OPTIMAL or model.status == gp.GRB.SUBOPTIMAL:
-                    # Extract the solution
-                    solution = []
-                    for i in range(n):
-                        var = model.getVarByName(f"w[{i}]")
-                        # print(f"w {i} = {var.X}")
-                        solution.append(var.X)
+                if model.status in (gp.GRB.OPTIMAL, gp.GRB.SUBOPTIMAL):
+                    # Directly extract the solution vector from MVar
+                    solution = model.getVarByName("w[0]").X  # This way will cause an error, use w.X
+                    solution = w.X.tolist()
+                else:
+                    # If the solver fails, fallback to equal weight to avoid interruption
+                    solution = [1.0 / n] * n
 
         return solution
+
 
     def calculate_portfolio_returns(self):
         # Ensure weights are calculated
