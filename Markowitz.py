@@ -1,89 +1,327 @@
+"""
+Package Import
+"""
+import yfinance as yf
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import quantstats as qs
+import gurobipy as gp
+import argparse
+import warnings
+import sys
+
+"""
+Project Setup
+"""
+warnings.simplefilter(action="ignore", category=FutureWarning)
+
+assets = [
+    "SPY",
+    "XLB",
+    "XLC",
+    "XLE",
+    "XLF",
+    "XLI",
+    "XLK",
+    "XLP",
+    "XLRE",
+    "XLU",
+    "XLV",
+    "XLY",
+]
+
+start = "2019-01-01"
+end = "2024-04-01"
+
+# Initialize df and df_returns
+df = pd.DataFrame()
+for asset in assets:
+    raw = yf.download(asset, start=start, end=end, auto_adjust = False)
+    df[asset] = raw['Adj Close']
+
+df_returns = df.pct_change().fillna(0)
+
+
+"""
+Problem 1: 
+
+Implement an equal weighting strategy as dataframe "eqw". Please do "not" include SPY.
+"""
+
+
+class EqualWeightPortfolio:
+    def __init__(self, exclude):
+        self.exclude = exclude
+
     def calculate_weights(self):
         # Get the assets by excluding the specified column
-        assets = self.price.columns[self.price.columns != self.exclude]
+        assets = df.columns[df.columns != self.exclude]
+        self.portfolio_weights = pd.DataFrame(index=df.index, columns=df.columns)
+
+        """
+        TODO: Complete Task 1 Below
+        """
+        # Assign a fixed equal weight to all assets except the one in exclude
+        n_assets = len(assets)
+        # The weight of each asset = 1 / n_assets
+        equal_weights = np.ones(n_assets, dtype=float) / n_assets
+        self.portfolio_weights.loc[:, assets] = equal_weights
+        
+
+        """
+        TODO: Complete Task 1 Above
+        """
+        self.portfolio_weights.ffill(inplace=True)
+        self.portfolio_weights.fillna(0, inplace=True)
+
+    def calculate_portfolio_returns(self):
+        # Ensure weights are calculated
+        if not hasattr(self, "portfolio_weights"):
+            self.calculate_weights()
+
+        # Calculate the portfolio returns
+        self.portfolio_returns = df_returns.copy()
+        assets = df.columns[df.columns != self.exclude]
+        self.portfolio_returns["Portfolio"] = (
+            self.portfolio_returns[assets]
+            .mul(self.portfolio_weights[assets])
+            .sum(axis=1)
+        )
+
+    def get_results(self):
+        # Ensure portfolio returns are calculated
+        if not hasattr(self, "portfolio_returns"):
+            self.calculate_portfolio_returns()
+
+        return self.portfolio_weights, self.portfolio_returns
+
+
+"""
+Problem 2:
+
+Implement a risk parity strategy as dataframe "rp". Please do "not" include SPY.
+"""
+
+
+class RiskParityPortfolio:
+    def __init__(self, exclude, lookback=50):
+        self.exclude = exclude
+        self.lookback = lookback
+
+    def calculate_weights(self):
+        # Get the assets by excluding the specified column
+        assets = df.columns[df.columns != self.exclude]
 
         # Calculate the portfolio weights
-        self.portfolio_weights = pd.DataFrame(
-            index=self.price.index, columns=self.price.columns
-        )
+        self.portfolio_weights = pd.DataFrame(index=df.index, columns=df.columns)
 
         """
-        TODO: Complete Task 4 Below
+        TODO: Complete Task 2 Below
         """
+        # Get the returns of all assets except SPY 
+        sub_ret = df_returns[assets]
 
-        # 只對 sector（排除 SPY）做配置
-        sector_cols = assets
+        # Calculate risk parity weights each day, starting from where we have enough lookback data
+        for i in range(self.lookback + 1, len(df)):
+            # Take the window of past lookback days of returns (excluding today)
+            window = sub_ret.iloc[i - self.lookback : i]
 
-        # 動能與波動視窗（可以之後自行微調）
-        mom_window = max(self.lookback, 60)   # 用至少 60 天做動能
-        vol_window = max(self.lookback // 2, 20)  # 用較短視窗估波動
-        top_k = 3                             # 每次選動能最高的 3 檔
+            # Use numpy to manually calculate the standard deviation of each asset (do not use pandas' std())
+            # Steps: first calculate mean, then mean squared difference, then take sqrt
+            mean_vec = window.mean(axis=0).to_numpy()            # Mean return of each asset
+            diff_sq = (window.to_numpy() - mean_vec) ** 2        # (r - μ)^2
+            var_vec = diff_sq.mean(axis=0)                       # Variance of each asset
+            sigma = np.sqrt(var_vec)                             # Volatility of each asset
 
-        # 使用 log-return 當作動能基礎（和 Ref1 的 product 寫法不同）
-        sector_ret = self.returns[sector_cols]
-        log_ret = np.log1p(sector_ret)
+            # Skip abnormal numerical situations (avoid division by zero)
+            sigma_adj = np.maximum(sigma, 1e-12)
 
-        # rolling 動能分數：sum of log(1+r)
-        rolling_mom = (
-            log_ret.rolling(window=mom_window, min_periods=mom_window)
-                   .sum()
-        )
+            # Risk parity score: The lower the volatility, the higher the score
+            score = 1.0 / sigma_adj
 
-        # rolling 波動度：用原始日報酬的標準差
-        rolling_vol = (
-            sector_ret.rolling(window=vol_window, min_periods=vol_window)
-                      .std()
-        )
-
-        for idx, date in enumerate(self.price.index):
-            # 一開始資料不足就跳過，之後由 ffill 補齊
-            if idx < max(mom_window, vol_window):
-                continue
-
-            mom_today = rolling_mom.loc[date]
-            vol_today = rolling_vol.loc[date]
-
-            # 若今天沒有有效數值，跳過
-            if mom_today.isna().all() or vol_today.isna().all():
-                continue
-
-            # 只保留動能為正的 sector，若沒有就用全部
-            positive = mom_today[mom_today > 0]
-            if positive.empty:
-                ranked = mom_today.sort_values(ascending=False)
+            total = score.sum()
+            if total <= 0:
+                # Should not happen in theory, but for insurance use equal weight
+                w = np.full(len(assets), 1.0 / len(assets))
             else:
-                ranked = positive.sort_values(ascending=False)
+                # Normalize to weights so the sum is 1
+                w = score * (1.0 / total)
 
-            # 取動能最高的 top_k 檔
-            selected = ranked.head(top_k).index
+            # Save the weights for day i (only fill columns not including SPY)
+            self.portfolio_weights.loc[df.index[i], assets] = w
 
-            # 取出這幾檔的短期波動度
-            vol_sel = vol_today.loc[selected].replace(0.0, np.nan)
-
-            # inverse-vol 權重分數
-            inv_vol = 1.0 / vol_sel
-            inv_vol = inv_vol.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-            score_sum = inv_vol.sum()
-            if score_sum > 0:
-                weights_sel = inv_vol / score_sum
-            else:
-                # fallback：如果波動度有問題，就改成等權
-                weights_sel = pd.Series(1.0 / len(selected), index=selected)
-
-            # 建立當日完整權重向量：只在 selected 上有部位
-            today_w = pd.Series(0.0, index=self.price.columns)
-            today_w.loc[selected] = weights_sel
-
-            # SPY 權重強制為 0
-            today_w.loc[self.exclude] = 0.0
-
-            # 寫入當日權重
-            self.portfolio_weights.loc[date, :] = today_w
 
         """
-        TODO: Complete Task 4 Above
+        TODO: Complete Task 2 Above
         """
 
         self.portfolio_weights.ffill(inplace=True)
         self.portfolio_weights.fillna(0, inplace=True)
+
+    def calculate_portfolio_returns(self):
+        # Ensure weights are calculated
+        if not hasattr(self, "portfolio_weights"):
+            self.calculate_weights()
+
+        # Calculate the portfolio returns
+        self.portfolio_returns = df_returns.copy()
+        assets = df.columns[df.columns != self.exclude]
+        self.portfolio_returns["Portfolio"] = (
+            self.portfolio_returns[assets]
+            .mul(self.portfolio_weights[assets])
+            .sum(axis=1)
+        )
+
+    def get_results(self):
+        # Ensure portfolio returns are calculated
+        if not hasattr(self, "portfolio_returns"):
+            self.calculate_portfolio_returns()
+
+        return self.portfolio_weights, self.portfolio_returns
+
+
+"""
+Problem 3:
+
+Implement a Markowitz strategy as dataframe "mv". Please do "not" include SPY.
+"""
+
+
+class MeanVariancePortfolio:
+    def __init__(self, exclude, lookback=50, gamma=0):
+        self.exclude = exclude
+        self.lookback = lookback
+        self.gamma = gamma
+
+    def calculate_weights(self):
+        # Get the assets by excluding the specified column
+        assets = df.columns[df.columns != self.exclude]
+
+        # Calculate the portfolio weights
+        self.portfolio_weights = pd.DataFrame(index=df.index, columns=df.columns)
+
+        for i in range(self.lookback + 1, len(df)):
+            R_n = df_returns.copy()[assets].iloc[i - self.lookback : i]
+            self.portfolio_weights.loc[df.index[i], assets] = self.mv_opt(
+                R_n, self.gamma
+            )
+
+        self.portfolio_weights.ffill(inplace=True)
+        self.portfolio_weights.fillna(0, inplace=True)
+
+    def mv_opt(self, R_n, gamma):
+        # R_n: the past lookback days' returns (DataFrame with columns = assets)
+        # gamma: risk aversion coefficient
+
+        # Estimate μ and Σ
+        mu = R_n.mean().values           # shape: (n,)
+        Sigma = R_n.cov().values         # shape: (n, n)
+        n = len(mu)
+
+        with gp.Env(empty=True) as env:
+            env.setParam("OutputFlag", 0)
+            env.setParam("DualReductions", 0)
+            env.start()
+            with gp.Model(env=env, name="portfolio") as model:
+                """
+                TODO: Complete Task 3 Below
+                """
+
+                # Decision variables: asset weights w_i, long-only: w_i >= 0
+                # Set ub=1 to avoid excessive weights 
+                w = model.addMVar(shape=n, lb=0.0, ub=1.0, name="w")
+
+                # Budget constraint: weights sum to 1 (fully invested)
+                model.addConstr(w.sum() == 1.0, name="budget")
+
+                # Linear part: w^T μ
+                ret_term = mu @ w
+
+                # Quadratic risk term: w^T Σ w
+                risk_term = w @ Sigma @ w
+
+                # Avoid the case where gamma is None
+                if gamma is None:
+                    gamma = 0.0
+
+                # Objective: max w^T μ − (γ/2) w^T Σ w
+                model.setObjective(ret_term - 0.5 * float(gamma) * risk_term,
+                                   gp.GRB.MAXIMIZE)
+
+                """
+                TODO: Complete Task 3 Above
+                """
+                model.optimize()
+
+                if model.status in (gp.GRB.OPTIMAL, gp.GRB.SUBOPTIMAL):
+                     
+                    solution = model.getVarByName("w[0]").X  # This way will cause an error, use w.X
+                    solution = w.X.tolist()
+                else:
+                    # If the solver fails, fallback to equal weight to avoid interruption
+                    solution = [1.0 / n] * n
+
+        return solution
+
+
+    def calculate_portfolio_returns(self):
+        # Ensure weights are calculated
+        if not hasattr(self, "portfolio_weights"):
+            self.calculate_weights()
+
+        # Calculate the portfolio returns
+        self.portfolio_returns = df_returns.copy()
+        assets = df.columns[df.columns != self.exclude]
+        self.portfolio_returns["Portfolio"] = (
+            self.portfolio_returns[assets]
+            .mul(self.portfolio_weights[assets])
+            .sum(axis=1)
+        )
+
+    def get_results(self):
+        # Ensure portfolio returns are calculated
+        if not hasattr(self, "portfolio_returns"):
+            self.calculate_portfolio_returns()
+
+        return self.portfolio_weights, self.portfolio_returns
+
+
+if __name__ == "__main__":
+    # Import grading system (protected file in GitHub Classroom)
+    from grader import AssignmentJudge
+
+    parser = argparse.ArgumentParser(
+        description="Introduction to Fintech Assignment 3 Part 1"
+    )
+    """
+    NOTE: For Assignment Judge
+    """
+    parser.add_argument(
+        "--score",
+        action="append",
+        help="Score for assignment",
+    )
+
+    parser.add_argument(
+        "--allocation",
+        action="append",
+        help="Allocation for asset",
+    )
+
+    parser.add_argument(
+        "--performance",
+        action="append",
+        help="Performance for portfolio",
+    )
+
+    parser.add_argument(
+        "--report", action="append", help="Report for evaluation metric"
+    )
+
+    args = parser.parse_args()
+
+    judge = AssignmentJudge()
+    
+    # All grading logic is protected in grader.py
+    judge.run_grading(args)
